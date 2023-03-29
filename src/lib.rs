@@ -2,26 +2,45 @@ use bdk::chain::{
     keychain::{KeychainChangeSet, KeychainTracker, PersistBackend},
     sparse_chain::ChainPosition,
 };
+use sled::IVec;
 
 pub struct SledStore<K, P> {
     db: sled::Tree,
-    counter: usize,
+    counter: u64,
     phantom: std::marker::PhantomData<(K, P)>,
 }
 
 impl<K, P> SledStore<K, P> {
-    pub fn new(db: sled::Tree) -> Self {
-        Self { db, counter: 0, phantom: std::marker::PhantomData }
+    pub fn new(db: sled::Tree) -> Result<Self, sled::Error> {
+        let counter_bytes = db
+            .get("counter")?
+            .unwrap_or_else(|| IVec::from(0u64.to_le_bytes().to_vec()))
+            .to_vec()
+            .as_slice()
+            .try_into()
+            .expect("Invalid counter");
+
+        Ok(Self {
+            db,
+            counter: u64::from_le_bytes(counter_bytes),
+            phantom: std::marker::PhantomData,
+        })
     }
 
     fn iter_changesets(&self) -> impl Iterator<Item = Result<KeychainChangeSet<K, P>, sled::Error>>
     where
         KeychainChangeSet<K, P>: serde::de::DeserializeOwned,
     {
-        self.db.iter().map(|k_v| {
-            let (_k, v) = k_v?;
-            let changeset = bincode::deserialize(&v).expect("Failed to deserialize changeset");
-            Ok(changeset)
+        self.db.iter().filter_map(|k_v| {
+            let Ok((k, v)) = k_v else {
+                return None;
+            };
+            if k != "counter".as_bytes() {
+                let changeset = bincode::deserialize(&v).expect("Failed to deserialize changeset");
+                Some(Ok(changeset))
+            } else {
+                None
+            }
         })
     }
 }
@@ -47,9 +66,9 @@ where
             self.counter.to_le_bytes(),
             bincode::serialize(changeset).expect("Failed to serialize changeset"),
         )?;
-        self.db.flush().expect("Failed to flush changeset");
-
         self.counter += 1;
+        self.db.insert("counter", &self.counter.to_le_bytes())?;
+
         Ok(())
     }
 
@@ -60,6 +79,7 @@ where
         for changeset in self.iter_changesets() {
             tracker.apply_changeset(changeset?)
         }
+
         Ok(())
     }
 }
@@ -94,14 +114,26 @@ mod tests {
         ]
     }
 
-    #[tokio::test]
-    async fn works() {
+    fn new_tree() -> sled::Tree {
         let db: sled::Db = sled::Config::new().temporary(true).open().unwrap();
-        let tree: sled::Tree = db.open_tree(b"abra").unwrap();
+        db.open_tree(b"abra").unwrap()
+    }
 
-        let mut store = SledStore::new(tree);
-        for changeset in test_changesets() {
+    #[test]
+    fn works() {
+        let tree = new_tree();
+
+        let mut store = SledStore::new(tree).unwrap();
+        assert_eq!(store.counter, 0);
+
+        for (i, changeset) in test_changesets().into_iter().enumerate() {
             store.append_changeset(&changeset).expect("Should apply");
+
+            assert_eq!(store.counter, i as u64 + 1);
+            assert_eq!(
+                store.db.get("counter").unwrap().unwrap().to_vec(),
+                store.counter.to_le_bytes().to_vec()
+            );
         }
 
         // Compare serialized changesets because `PartialEq` isn't implemented for
@@ -113,5 +145,14 @@ mod tests {
         );
 
         // TODO: test `load_into_keychain_tracker`.
+    }
+
+    #[test]
+    fn restores_counter() {
+        let tree = new_tree();
+        tree.insert("counter", &42u64.to_le_bytes()).unwrap();
+
+        let store: SledStore<TestKeychain, TxHeight> = SledStore::new(tree).unwrap();
+        assert_eq!(store.counter, 42);
     }
 }
