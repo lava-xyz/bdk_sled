@@ -1,10 +1,7 @@
-use std::ops::RangeFull;
-
 use bdk::chain::{
     keychain::{KeychainChangeSet, KeychainTracker, PersistBackend},
     sparse_chain::ChainPosition,
 };
-use sled::IVec;
 
 pub struct SledStore<K, P> {
     db: sled::Tree,
@@ -14,11 +11,18 @@ pub struct SledStore<K, P> {
 
 impl<K, P> SledStore<K, P> {
     pub fn new(db: sled::Tree) -> Self {
-        Self {
-            db,
-            counter: 0,
-            phantom: std::marker::PhantomData,
-        }
+        Self { db, counter: 0, phantom: std::marker::PhantomData }
+    }
+
+    fn iter_changesets(&self) -> impl Iterator<Item = Result<KeychainChangeSet<K, P>, sled::Error>>
+    where
+        KeychainChangeSet<K, P>: serde::de::DeserializeOwned,
+    {
+        self.db.iter().map(|k_v| {
+            let (_k, v) = k_v?;
+            let changeset = bincode::deserialize(&v).expect("Failed to deserialize changeset");
+            Ok(changeset)
+        })
     }
 }
 
@@ -43,7 +47,9 @@ where
             self.counter.to_le_bytes(),
             bincode::serialize(changeset).expect("Failed to serialize changeset"),
         )?;
+        self.db.flush().expect("Failed to flush changeset");
 
+        self.counter += 1;
         Ok(())
     }
 
@@ -51,11 +57,61 @@ where
         &mut self,
         tracker: &mut KeychainTracker<K, P>,
     ) -> Result<(), Self::LoadError> {
-        for k_v in self.db.range::<IVec, RangeFull>(..) {
-            let (_k, v) = k_v?;
-            tracker
-                .apply_changeset(bincode::deserialize(&v).expect("Failed to deserialize changeset"))
+        for changeset in self.iter_changesets() {
+            tracker.apply_changeset(changeset?)
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk::chain::{keychain::DerivationAdditions, TxHeight};
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+
+    #[derive(Ord, PartialOrd, Eq, PartialEq, Clone, Debug, Serialize, Deserialize)]
+    enum TestKeychain {
+        External,
+        Internal,
+    }
+
+    fn test_changesets() -> Vec<KeychainChangeSet<TestKeychain, TxHeight>> {
+        vec![
+            KeychainChangeSet {
+                derivation_indices: DerivationAdditions(
+                    vec![(TestKeychain::External, 42)].into_iter().collect(),
+                ),
+                chain_graph: Default::default(),
+            },
+            KeychainChangeSet {
+                derivation_indices: DerivationAdditions(
+                    vec![(TestKeychain::External, 43)].into_iter().collect(),
+                ),
+                chain_graph: Default::default(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn works() {
+        let db: sled::Db = sled::Config::new().temporary(true).open().unwrap();
+        let tree: sled::Tree = db.open_tree(b"abra").unwrap();
+
+        let mut store = SledStore::new(tree);
+        for changeset in test_changesets() {
+            store.append_changeset(&changeset).expect("Should apply");
+        }
+
+        // Compare serialized changesets because `PartialEq` isn't implemented for
+        // `KeychainChangeSet`.
+        assert_eq!(
+            bincode::serialize(&test_changesets()).unwrap(),
+            bincode::serialize(&store.iter_changesets().collect::<Result<Vec<_>, _>>().unwrap())
+                .unwrap()
+        );
+
+        // TODO: test `load_into_keychain_tracker`.
     }
 }
