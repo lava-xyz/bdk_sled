@@ -1,9 +1,16 @@
+//! A BDK's [`PersistBackend`] implementation for [`sled`].
+//!
+//! [`PersistBackend`]: bdk::chain::keychain::PersistBackend
+
 use bdk::chain::{
     keychain::{KeychainChangeSet, KeychainTracker, PersistBackend},
     sparse_chain::ChainPosition,
 };
 use sled::IVec;
 
+/// Implements [`PersistBackend`] for [`sled::Tree`].
+///
+/// [`PersistBackend`]: bdk::chain::keychain::PersistBackend
 pub struct SledStore<K, P> {
     db: sled::Tree,
     counter: u64,
@@ -11,6 +18,10 @@ pub struct SledStore<K, P> {
 }
 
 impl<K, P> SledStore<K, P> {
+    /// Creates a new `SledStore` from a `sled::Tree`.
+    ///
+    /// Returns an error if `db` is corrupted. You must only use either empty
+    /// `sled::Tree` or one previously used by [`SledStore`].
     pub fn new(db: sled::Tree) -> Result<Self, sled::Error> {
         let counter_bytes = db
             .get("counter")?
